@@ -10,7 +10,7 @@ using UnhollowerBaseLib;
 using UnityEngine;
 using CMS;
 
-[assembly: MelonInfo(typeof(BoltEvents.BoltEventsMod), "BoltEvents", "1.6.0", "MidCrusadero", "")]
+[assembly: MelonInfo(typeof(BoltEvents.BoltEventsMod), "BoltEvents", "1.6.1", "MidCrusadero", "")]
 [assembly: MelonGame("Red Dot Games", "Car Mechanic Simulator 2021")]
 
 namespace BoltEvents
@@ -23,14 +23,23 @@ namespace BoltEvents
     //    the bolt seizes back (IsStuck = true), player has to spray again.
     //
     //  - "The bolt gave way" (ChanceUnscrewNoWd40Percent, default 15%):
-    //    pure force loosens the bolt without WD-40.
+    //    pure force loosens the bolt without WD-40, awards
+    //    BoltGaveWayExpReward (default 5, 0 = none) XP.
     //
     //  - "Stripped threads" (ChanceStrippedThreadsPercent / 4% WD-40 path,
     //    ChanceSlipStrippedPercent / 7% ratchet path): the bolt is flagged;
     //    when it later comes off, the part it held loses
     //    StrippedConditionLossPercent (default 5%) of its current condition,
     //    the player pays StrippedMoneyPenalty (default 50) CR and gains
-    //    StrippedExpReward (default 5) XP.
+    //    StrippedExpReward (default 5, 0 = none) XP.
+    //
+    //  1.6.1: input guard after "WD-40 didn't help" — if the mouse button
+    //  is still held from the pre-spray unscrew attempt, the game keeps
+    //  driving its rotation flow against the freshly re-stuck bolt (ratchet
+    //  sound loops, cursor gets dragged back to the bolt). For
+    //  Wd40FailGuardSeconds (default 1.5) the guard re-asserts IsStuck,
+    //  keeps the cursor free and blocks new bolt actions until the button
+    //  is released.
     //
     // Configuration: <game>\Mods\BoltEvents\BoltEvents.cfg (INI-style,
     // UTF-8, "#" or ";" comments, split on the FIRST "="). The file is
@@ -51,6 +60,16 @@ namespace BoltEvents
         private static int cfgCondLossPercent = 5;
         private static int cfgMoneyPenalty = 50;
         private static int cfgExpReward = 5;
+
+        // "The bolt gave way" outcome: XP for loosening a stuck bolt by
+        // pure force (0 = no reward).
+        private static int cfgGaveExpReward = 5;
+
+        // Anti-glitch guard after "WD-40 didn't help", seconds. While the
+        // mouse button is still held from the pre-spray attempt the mod
+        // keeps the bolt stuck and the cursor free, so the game's rotation
+        // flow cannot loop against the re-stuck bolt.
+        private static float cfgWd40GuardSeconds = 1.5f;
 
         // All popup phrases are user-configurable, per language. {0} in the
         // stripped-threads texts is replaced with the condition loss value.
@@ -78,6 +97,7 @@ namespace BoltEvents
         private static readonly HashSet<IntPtr> StrippedBolts = new HashSet<IntPtr>();
         private static readonly HashSet<IntPtr> SeizedBolts = new HashSet<IntPtr>();
         private static readonly Dictionary<IntPtr, float> LastSlipRoll = new Dictionary<IntPtr, float>();
+        private static readonly HashSet<IntPtr> Wd40Guard = new HashSet<IntPtr>();
 
         private static string ConfigPath
         {
@@ -131,6 +151,8 @@ namespace BoltEvents
                 case "StrippedConditionLossPercent": cfgCondLossPercent = ParseInt(val, cfgCondLossPercent); break;
                 case "StrippedMoneyPenalty": cfgMoneyPenalty = ParseInt(val, cfgMoneyPenalty); break;
                 case "StrippedExpReward": cfgExpReward = ParseInt(val, cfgExpReward); break;
+                case "BoltGaveWayExpReward": cfgGaveExpReward = ParseInt(val, cfgGaveExpReward); break;
+                case "Wd40FailGuardSeconds": cfgWd40GuardSeconds = ParseFloat(val, cfgWd40GuardSeconds); break;
                 case "TitleRU": cfgTitleRu = val; break;
                 case "TitleEN": cfgTitleEn = val; break;
                 case "Wd40FailedRU": cfgWd40Ru = val; break;
@@ -147,6 +169,13 @@ namespace BoltEvents
         private static int ParseInt(string val, int fallback)
         {
             return int.TryParse(val, out int n) ? n : fallback;
+        }
+
+        private static float ParseFloat(string val, float fallback)
+        {
+            return float.TryParse(val,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float f) ? f : fallback;
         }
 
         private static bool ParseBool(string val, bool fallback)
@@ -191,12 +220,22 @@ namespace BoltEvents
                     "# ratchet clicks (LMB) or WD-40 (RMB), where the events above apply.",
                     "ChanceSeizeNormalBoltPercent = 10",
                     "",
+                    "# Input guard after \"WD-40 didn't help\", seconds: while the mouse",
+                    "# button is still held from the pre-spray attempt, the mod keeps the",
+                    "# bolt stuck and the cursor free so the game's rotation flow cannot",
+                    "# loop against the re-stuck bolt (stuck ratchet sound / dragged",
+                    "# cursor). 0 disables the guard.",
+                    "Wd40FailGuardSeconds = 1.5",
+                    "",
                     "# \"Stripped threads\" outcome: percent of the part's CURRENT",
-                    "# condition lost (100% part -> -5 at default), money penalty in CR",
-                    "# (charged only if you can afford it) and experience reward.",
+                    "# condition lost (100% part -> 95 at default), money penalty in CR",
+                    "# (charged only if you can afford it) and experience reward (0 = none).",
                     "StrippedConditionLossPercent = 5",
                     "StrippedMoneyPenalty = 50",
                     "StrippedExpReward = 5",
+                    "",
+                    "# \"The bolt gave way\" outcome: experience reward (0 = none).",
+                    "BoltGaveWayExpReward = 5",
                     "",
                     "# Verbose logging to MelonLoader console / log file.",
                     "DebugLog = false",
@@ -448,6 +487,64 @@ namespace BoltEvents
                 bolt.IsStuck = true;
                 ReleaseCursorLock();
                 ShowEventPopup(cfgWd40Ru, cfgWd40En);
+                // If the player is still holding LMB from the pre-spray
+                // unscrew attempt, the game keeps driving its rotation
+                // flow against the re-stuck bolt (ratchet sound loops,
+                // cursor dragged back). Guard until the button is released.
+                StartWd40Guard(bolt, key);
+            }
+        }
+
+        // Blocks the stuck-bolt state in place while the mouse button is
+        // still held after a "WD-40 didn't help" event. Every frame of the
+        // guard: re-assert IsStuck, keep the cursor free and disable new
+        // bolt actions, so the game's per-frame rotation flow has nothing
+        // to chew on. Ends when LMB is released, the bolt goes away, or
+        // the guard window expires. Wd40FailGuardSeconds = 0 disables it.
+        private static void StartWd40Guard(MountObject bolt, IntPtr key)
+        {
+            if (cfgWd40GuardSeconds <= 0f) return;
+            lock (Wd40Guard)
+            {
+                if (!Wd40Guard.Add(key)) return; // already guarded
+            }
+            MelonCoroutines.Start(GuardWd40FailedBolt(bolt, key, cfgWd40GuardSeconds));
+        }
+
+        private static IEnumerator GuardWd40FailedBolt(MountObject bolt, IntPtr key, float guardSeconds)
+        {
+            Log("WD40-fail guard ON bolt=" + key + " for " + guardSeconds + "s");
+            // Disable new bolt actions for the guard window (the game's own
+            // rotation loop does not consult it, but click-driven paths do).
+            bool hadCanAction = true, touchedCanAction = false;
+            try
+            {
+                hadCanAction = bolt.canAction;
+                bolt.canAction = false;
+                touchedCanAction = true;
+            }
+            catch { }
+            try
+            {
+                float t = guardSeconds;
+                while (bolt != null && t > 0f)
+                {
+                    t -= Time.deltaTime;
+                    if (bolt.unmounted) break;
+                    if (!Input.GetMouseButton(0)) break; // released: vanilla stuck flow resumes
+                    try { bolt.IsStuck = true; } catch { }
+                    ReleaseCursorLock();
+                    yield return null;
+                }
+            }
+            finally
+            {
+                if (touchedCanAction)
+                {
+                    try { bolt.canAction = hadCanAction; } catch { }
+                }
+                lock (Wd40Guard) { Wd40Guard.Remove(key); }
+                Log("WD40-fail guard OFF bolt=" + key);
             }
         }
 
@@ -480,6 +577,12 @@ namespace BoltEvents
             ReloadConfig();
             if (!cfgEnabled) return;
             if (!__instance.IsStuck || __instance.unmounted) return;
+            // A fresh "WD-40 didn't help" guard owns this bolt until the
+            // button is released — no slip rolls during the hand-over.
+            lock (Wd40Guard)
+            {
+                if (Wd40Guard.Contains(key)) return;
+            }
 
             lock (LastSlipRoll)
             {
@@ -515,7 +618,23 @@ namespace BoltEvents
             else if (roll < cfgSlipStripped + cfgNoWd40)
             {
                 __instance.IsStuck = false;
+                AwardExp(cfgGaveExpReward);
                 ShowEventPopup(cfgGaveRu, cfgGaveEn);
+            }
+        }
+
+        // Shared XP award; silently skipped when the configured value is 0.
+        private static void AwardExp(int amount)
+        {
+            if (amount == 0) return;
+            try
+            {
+                GlobalData.AddExpAmount = amount;
+                UIManager.Get().RefreshStatsUICoroutine(StatType.Experience);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("BoltEvents: XP award failed: " + e.Message);
             }
         }
 
@@ -883,8 +1002,7 @@ namespace BoltEvents
                 GlobalData.AddMoneyAmount = -cfgMoneyPenalty;
                 UIManager.Get().RefreshStatsUICoroutine(StatType.Money);
             }
-            GlobalData.AddExpAmount = cfgExpReward;
-            UIManager.Get().RefreshStatsUICoroutine(StatType.Experience);
+            AwardExp(cfgExpReward);
 
             // Condition is a 0..1 fraction; show the loss in percent points.
             string dmg = (damage * 100f).ToString("0.#");

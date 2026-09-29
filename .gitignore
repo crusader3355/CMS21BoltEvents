@@ -1,2 +1,5 @@
 *.dll
 .tools/
+BoltEvents_v160_reference.cs
+dist/BoltEvents_v1.6.0.zip
+dist/README.txt
